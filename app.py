@@ -89,7 +89,7 @@ const App: React.FC = () => {
         }
 
         // Clean up old items not in feed anymore? 
-        // For a dashboard, we might want to keep them, but let's limit to top 30 to prevent memory leak
+        # For a dashboard, we might want to keep them, but let's limit to top 30 to prevent memory leak
         const final = merged.sort((a, b) => b.pubDate.getTime() - a.pubDate.getTime()).slice(0, 30);
         
         if (hasNewHighPriority && "Notification" in window && Notification.permission === "granted") {
