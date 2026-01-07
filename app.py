@@ -1,183 +1,179 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { FeedConfig, NewsItem, ProcessingStatus } from './types';
-import { fetchFeed } from './services/rssService';
-import { analyzeNewsItem } from './services/geminiService';
-import NewsCard from './components/NewsCard';
-import DashboardHeader from './components/DashboardHeader';
+import streamlit as st
+import feedparser
+import google.generativeai as genai
+import time
+from datetime import datetime
+import os
 
-// Feed Configurations
-const FEEDS: FeedConfig[] = [
-  { id: 'techcrunch', name: 'TechCrunch AI', url: 'https://techcrunch.com/category/artificial-intelligence/feed/', color: '#16a34a' }, // Green
-  { id: 'openai', name: 'OpenAI Blog', url: 'https://openai.com/index.xml', color: '#000000' }, // Black (Rendered as white/grey in dark mode)
-  { id: 'deepmind', name: 'Google DeepMind', url: 'https://deepmind.google/rss/blog', color: '#4285F4' }, // Google Blue
-];
+# 1. 페이지 설정 (가장 위에 있어야 함)
+st.set_page_config(
+    page_title="AI News Curator",
+    page_icon="🤖",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-const REFRESH_INTERVAL = 15 * 60 * 1000; // 15 minutes
-
-const App: React.FC = () => {
-  const [items, setItems] = useState<NewsItem[]>([]);
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
-  const [nextUpdate, setNextUpdate] = useState<Date>(new Date(Date.now() + REFRESH_INTERVAL));
-  const processingQueueRef = useRef<Set<string>>(new Set());
-
-  // Function to process a single item with Gemini
-  const processItem = useCallback(async (item: NewsItem) => {
-    // If already processing or completed, skip
-    if (processingQueueRef.current.has(item.id) || item.status === ProcessingStatus.COMPLETED) return;
-
-    processingQueueRef.current.add(item.id);
-    
-    // Update status to PROCESSING UI
-    setItems(prev => prev.map(i => i.id === item.id ? { ...i, status: ProcessingStatus.PROCESSING } : i));
-
-    try {
-      const result = await analyzeNewsItem(item.originalTitle, item.originalContent);
-      
-      setItems(prev => prev.map(i => {
-        if (i.id === item.id) {
-          return {
-            ...i,
-            status: ProcessingStatus.COMPLETED,
-            translatedTitle: result.translatedTitle,
-            summary: result.summary,
-          };
-        }
-        return i;
-      }));
-    } catch (error) {
-      console.error(`Failed to process item ${item.id}`, error);
-      setItems(prev => prev.map(i => i.id === item.id ? { ...i, status: ProcessingStatus.FAILED } : i));
-    } finally {
-      processingQueueRef.current.delete(item.id);
+# 2. 스타일 설정 (다크모드 & 카드 스타일)
+st.markdown("""
+<style>
+    .stApp {
+        background-color: #0f172a;
+        color: #e2e8f0;
     }
-  }, []);
-
-  // Main refresh logic
-  const refreshFeeds = useCallback(async () => {
-    if (isLoading) return;
-    setIsLoading(true);
-
-    try {
-      const promises = FEEDS.map(feed => fetchFeed(feed));
-      const results = await Promise.all(promises);
-      const fetchedItems = results.flat();
-
-      // Sort by date desc
-      fetchedItems.sort((a, b) => b.pubDate.getTime() - a.pubDate.getTime());
-
-      setItems(prevItems => {
-        // Explicitly cast to tuple to ensure correct Map type inference
-        const newItemsMap = new Map(fetchedItems.map(i => [i.id, i] as [string, NewsItem]));
-        const existingItemsMap = new Map(prevItems.map(i => [i.id, i] as [string, NewsItem]));
-        
-        const merged: NewsItem[] = [];
-        let hasNewHighPriority = false;
-
-        // Merge logic: Keep existing if already processed, otherwise use new
-        for (const [id, newItem] of newItemsMap) {
-          if (existingItemsMap.has(id)) {
-            const existing = existingItemsMap.get(id)!;
-            // Keep existing state but update isNew if logic requires (e.g., if it was seen before, it's not "new" anymore ideally, but let's keep simple)
-            merged.push(existing);
-          } else {
-            // Truly new item
-            newItem.isNew = true;
-            merged.push(newItem);
-            hasNewHighPriority = true;
-          }
-        }
-
-        // Clean up old items not in feed anymore? 
-        # For a dashboard, we might want to keep them, but let's limit to top 30 to prevent memory leak
-        const final = merged.sort((a, b) => b.pubDate.getTime() - a.pubDate.getTime()).slice(0, 30);
-        
-        if (hasNewHighPriority && "Notification" in window && Notification.permission === "granted") {
-           new Notification("새로운 AI 뉴스", { body: "새로운 뉴스가 업데이트 되었습니다." });
-        }
-
-        return final;
-      });
-
-      setLastUpdated(new Date());
-      setNextUpdate(new Date(Date.now() + REFRESH_INTERVAL));
-
-    } catch (error) {
-      console.error("Refresh failed", error);
-    } finally {
-      setIsLoading(false);
+    .news-card {
+        background-color: #1e293b;
+        border-radius: 10px;
+        padding: 20px;
+        margin-bottom: 20px;
+        border: 1px solid #334155;
     }
-  }, [isLoading]);
+    .source-tag {
+        font-size: 0.8em;
+        padding: 4px 8px;
+        border-radius: 15px;
+        font-weight: bold;
+        display: inline-block;
+        margin-bottom: 10px;
+    }
+    .highlight {
+        color: #38bdf8;
+        font-weight: bold;
+    }
+    a {
+        text-decoration: none;
+        color: #38bdf8;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-  // Initial Load & Interval
-  useEffect(() => {
-    refreshFeeds();
+# 3. API 키 설정 (Streamlit Secrets에서 가져오기)
+# 로컬 테스트용: 만약 secrets가 없으면 환경변수나 직접 입력 (주의: 배포시엔 secrets 사용 권장)
+try:
+    api_key = st.secrets["GOOGLE_API_KEY"]
+except:
+    # 임시: 로컬에서 테스트할 때만 아래에 키를 직접 넣으세요. 배포할 땐 지워야 합니다.
+    api_key = os.getenv("GOOGLE_API_KEY", "") 
+
+if not api_key:
+    st.error("API 키가 설정되지 않았습니다. Streamlit Secrets에 GOOGLE_API_KEY를 설정해주세요.")
+    st.stop()
+
+genai.configure(api_key=api_key)
+
+# 4. 뉴스 소스 설정
+FEEDS = [
+    {'id': 'techcrunch', 'name': 'TechCrunch AI', 'url': 'https://techcrunch.com/category/artificial-intelligence/feed/', 'color': '#16a34a'},
+    {'id': 'openai', 'name': 'OpenAI Blog', 'url': 'https://openai.com/index.xml', 'color': '#ffffff'}, # 글자색 가독성을 위해 흰색으로 조정
+    {'id': 'deepmind', 'name': 'Google DeepMind', 'url': 'https://deepmind.google/rss/blog', 'color': '#4285F4'},
+]
+
+# 5. Gemini 번역 함수
+def analyze_news(title, content):
+    model = genai.GenerativeModel('gemini-pro')
+    prompt = f"""
+    당신은 전문 AI 뉴스 큐레이터입니다. 아래 영문 뉴스 제목과 내용을 한국어로 번역하고 요약해주세요.
     
-    const intervalId = setInterval(refreshFeeds, REFRESH_INTERVAL);
-    return () => clearInterval(intervalId);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // Only mount
+    [원문 제목]: {title}
+    [원문 내용 일부]: {content[:500]}...
 
-  // Watch items for pending processing
-  useEffect(() => {
-    const pendingItems = items.filter(i => i.status === ProcessingStatus.PENDING);
-    // Process one by one or in small batches to be nice to the API
-    // We initiate all, but the browser/network limits concurrency naturally. 
-    // Gemini rate limits might be an issue, so we could throttle, but for this demo we'll fire.
-    pendingItems.forEach(item => {
-      processItem(item);
-    });
-  }, [items, processItem]);
+    [출력 형식]:
+    제목: (한국어 제목)
+    요약: (핵심 내용 3줄 요약)
+    한줄평: (이 뉴스의 업계 영향력 한 줄)
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"분석 실패: {str(e)}"
 
-  return (
-    <div className="min-h-screen bg-gray-950 text-slate-200 font-sans">
-      <DashboardHeader 
-        lastUpdated={lastUpdated} 
-        nextUpdate={nextUpdate} 
-        onRefresh={refreshFeeds}
-        isLoading={isLoading}
-      />
+# 6. 세션 상태 초기화 (새로고침 해도 데이터 유지)
+if 'news_items' not in st.session_state:
+    st.session_state.news_items = []
+if 'last_updated' not in st.session_state:
+    st.session_state.last_updated = None
 
-      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {/* Source Legend */}
-        <div className="flex flex-wrap gap-4 mb-8">
-          {FEEDS.map(feed => (
-            <div key={feed.id} className="flex items-center gap-2 text-sm bg-gray-900 px-3 py-1.5 rounded-full border border-gray-800">
-              <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: feed.color }}></span>
-              <span className="text-gray-400">{feed.name}</span>
-            </div>
-          ))}
-        </div>
+# 7. 메인 로직
+def main():
+    st.title("🤖 Global AI News Curator")
+    st.caption("TechCrunch, OpenAI, DeepMind의 최신 뉴스를 실시간으로 번역/요약합니다.")
 
-        {/* Content Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {items.map(item => {
-            const feedConfig = FEEDS.find(f => f.id === item.sourceId);
-            return (
-              <NewsCard 
-                key={item.id} 
-                item={item} 
-                sourceConfig={feedConfig} 
-                onAnalyze={processItem}
-              />
-            );
-          })}
-        </div>
+    # 사이드바에 새로고침 버튼
+    with st.sidebar:
+        st.header("설정")
+        if st.button("뉴스 새로고침"):
+            st.session_state.news_items = [] # 초기화 후 다시 로드
+            st.rerun()
 
-        {/* Empty State */}
-        {!isLoading && items.length === 0 && (
-          <div className="text-center py-20">
-             <div className="inline-block p-4 rounded-full bg-gray-900 mb-4 text-gray-600">
-                <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
-                </svg>
-             </div>
-             <p className="text-gray-500 text-lg">뉴스를 가져오는 중입니다...</p>
-          </div>
-        )}
-      </main>
-    </div>
-  );
-};
+    # 뉴스 데이터 로드 (캐시되지 않았거나 비어있을 때)
+    if not st.session_state.news_items:
+        all_items = []
+        with st.spinner('최신 AI 뉴스를 수집하고 있습니다...'):
+            for feed in FEEDS:
+                try:
+                    parsed_feed = feedparser.parse(feed['url'])
+                    # 각 피드에서 최신 3개만 가져오기 (속도 위해)
+                    for entry in parsed_feed.entries[:3]:
+                        item = {
+                            'source_id': feed['id'],
+                            'source_name': feed['name'],
+                            'color': feed['color'],
+                            'title': entry.title,
+                            'link': entry.link,
+                            'published': entry.get('published', 'N/A'),
+                            'summary_raw': entry.get('summary', '') or entry.get('description', ''),
+                            'analysis': None # 아직 번역 안됨
+                        }
+                        all_items.append(item)
+                except Exception as e:
+                    st.error(f"{feed['name']} 로드 실패: {e}")
+            
+            # 최신순 정렬
+            # (날짜 파싱이 복잡할 수 있어 단순 구현. 필요시 파싱 로직 추가 가능)
+            st.session_state.news_items = all_items
+            st.session_state.last_updated = datetime.now()
 
-export default App;
+    # 마지막 업데이트 시간 표시
+    if st.session_state.last_updated:
+        st.write(f"Last updated: {st.session_state.last_updated.strftime('%H:%M:%S')}")
+
+    # 뉴스 카드 출력
+    news_container = st.container()
+    
+    with news_container:
+        # 3열 그리드 생성
+        cols = st.columns(3)
+        
+        for idx, item in enumerate(st.session_state.news_items):
+            col = cols[idx % 3] # 0,1,2 열에 번갈아 배치
+            
+            with col:
+                # 카드 HTML/CSS 구조
+                st.markdown(f"""
+                <div class="news-card">
+                    <div style="color:{item['color']}; font-weight:bold; margin-bottom:5px;">
+                        • {item['source_name']}
+                    </div>
+                    <h3 style="color:white; font-size:1.1em; height: 60px; overflow:hidden;">{item['title']}</h3>
+                    <div style="font-size:0.8em; color:#94a3b8; margin-bottom:10px;">{item['published'][:16]}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # 번역/요약 버튼 (개별 실행으로 API 비용 절약)
+                btn_key = f"btn_{idx}"
+                if st.button(f"🇰🇷 번역 및 요약 보기", key=btn_key):
+                    if not item['analysis']:
+                        with st.spinner('Gemini가 읽고 있습니다...'):
+                            analysis = analyze_news(item['title'], item['summary_raw'])
+                            st.session_state.news_items[idx]['analysis'] = analysis
+                            st.rerun() # 화면 갱신
+                
+                # 번역 결과 표시
+                if item['analysis']:
+                    st.info(item['analysis'])
+                
+                st.markdown(f"[원문 보러가기 →]({item['link']})")
+                st.markdown("---")
+
+if __name__ == "__main__":
+    main()
